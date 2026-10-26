@@ -1,3 +1,4 @@
+/** @OnlyCurrentDoc */
 /* Th7 Board backend. Paste this whole file into Extensions > Apps Script. Built 2026-10-26. */
 /* Th7 core rules. Shared by the website (instant updates, demo mode) and the
    Google Apps Script backend (the real source of truth), so both sides agree
@@ -299,38 +300,48 @@ function doPost(e) {
 
   try {
     var cache = CacheService.getScriptCache();
-    var opKey = body.opId ? 'op:' + String(body.opId).slice(0, 40) : null;
+    var single = body.action !== 'batch';
+    var ops = single ? [{ opId: body.opId, action: body.action, payload: body.payload }] : (Array.isArray(body.ops) ? body.ops.slice(0, 40) : []);
     var db = readDb_(book);
-
-    if (opKey && cache.get(opKey)) {                      // a retry of something we already saved
-      var dup = stateFor_(db); dup.duplicate = true; return json_(dup);
-    }
-
     var before = {};
     Object.keys(DATA_TABS).forEach(function (k) { before[k] = JSON.stringify(db[k]); });
-
     var now = new Date();
     var ctx = { now: now.toISOString(), today: Utilities.formatDate(now, TZ, 'yyyy-MM-dd') };
-    var res = Th7Core.apply(db, body.action, body.payload || {}, ctx);
+    var results = [], removed = [], logs = [], doneKeys = [];
 
-    if (!res.ok) {
-      var st = stateFor_(readDb_(book));
-      st.ok = false; st.error = res.error; st.code = res.code;
-      return json_(st);
-    }
+    ops.forEach(function (op) {
+      op = op || {};
+      var key = op.opId ? 'op:' + String(op.opId).slice(0, 40) : null;
+      if (key && cache.get(key)) { results.push({ opId: op.opId, ok: true, duplicate: true }); return; }   // retry of a saved change
+      var trial = JSON.parse(JSON.stringify(db));                     // all-or-nothing per change
+      var res = Th7Core.apply(trial, op.action, op.payload || {}, ctx);
+      if (res.ok) {
+        db = trial;
+        if (res.removed) removed.push(res.removed);
+        if (res.changed.length) logs.push(op);
+        if (key) doneKeys.push(key);
+      }
+      results.push({ opId: op.opId, ok: res.ok, error: res.error, code: res.code });
+    });
 
     var changed = [];
     Object.keys(DATA_TABS).forEach(function (k) {
       if (JSON.stringify(db[k]) !== before[k]) { writeTable_(book, DATA_TABS[k], db[k]); changed.push(k); }
     });
-    if (res.removed) appendRow_(book, 'Removed', { removedAt: ctx.now, name: res.removed.name, data: JSON.stringify(res.removed) });
-    if (changed.length) {
-      appendRow_(book, 'Log', { at: ctx.now, who: whoFrom_(body), action: body.action, detail: JSON.stringify(body.payload || {}).slice(0, 1500) });
-    }
+    removed.forEach(function (m) { appendRow_(book, 'Removed', { removedAt: ctx.now, name: m.name, data: JSON.stringify(m) }); });
+    logs.forEach(function (op) { appendRow_(book, 'Log', { at: ctx.now, who: whoFrom_(op), action: op.action, detail: JSON.stringify(op.payload || {}).slice(0, 1500) }); });
     if (changed.indexOf('members') >= 0) buildFreeGrid_(book, db.members);
     SpreadsheetApp.flush();
-    if (opKey) cache.put(opKey, '1', 21600);
-    return json_(stateFor_(db));
+    doneKeys.forEach(function (k) { try { cache.put(k, '1', 21600); } catch (err) { /* ignore */ } });
+
+    var st = stateFor_(db);
+    st.results = results;
+    if (single) {
+      var r0 = results[0] || { ok: false, error: 'Nothing to do.' };
+      st.ok = r0.ok; if (!r0.ok) { st.error = r0.error; st.code = r0.code; }
+      if (r0.duplicate) st.duplicate = true;
+    }
+    return json_(st);
   } finally {
     lock.releaseLock();
   }
