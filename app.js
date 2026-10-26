@@ -261,26 +261,29 @@
     clearTimeout(S.retryTimer);
     S.flushing = true;
     renderSync();
-    var op = S.outbox[0];
-    op.inflight = true;
+    var batch = S.outbox.slice(0, 25);
+    batch.forEach(function (o) { o.inflight = true; });
     S.writeSeq++;
-    call({ action: op.action, payload: op.payload, opId: op.opId, code: S.code }).then(function (r) {
+    call({ action: 'batch', code: S.code, ops: batch.map(function (o) { return { opId: o.opId, action: o.action, payload: o.payload }; }) }).then(function (r) {
       S.online = true;
-      if (r.code === 'bad_code') { op.inflight = false; S.flushing = false; badCode(); return; }
-      if (r.code === 'busy') throw new Error('busy');
-      S.outbox.shift(); persistOutbox();
+      if (r.code === 'bad_code') { batch.forEach(function (o) { o.inflight = false; }); S.flushing = false; badCode(); return; }
+      if (r.code === 'busy' || !Array.isArray(r.results)) throw new Error(r.code || 'bad reply');
+      var ids = batch.map(function (o) { return o.opId; });
+      S.outbox = S.outbox.filter(function (o) { return ids.indexOf(o.opId) < 0; });
+      persistOutbox();
       setServer(r);
       S.retryDelay = 2000;
-      var w = waiters[op.opId]; delete waiters[op.opId];
-      if (!r.ok) {
-        toast(r.error || 'That did not save.', 'err');
-        if (w) w.rej(r);
-      } else if (w) w.res(r);
+      r.results.forEach(function (res) {
+        var w = waiters[res.opId]; delete waiters[res.opId];
+        if (!res.ok) { toast(res.error || 'That did not save.', 'err'); if (w) w.rej(res); }
+        else if (w) w.res(res);
+      });
       S.flushing = false;
       recompute(); decideGate(); render({ soft: true });
       if (S.outbox.length) flush();
     }).catch(function () {
-      op.inflight = false; S.flushing = false; S.online = false;
+      batch.forEach(function (o) { o.inflight = false; });
+      S.flushing = false; S.online = false;
       renderSync();
       S.retryTimer = setTimeout(flush, S.retryDelay);
       S.retryDelay = Math.min(S.retryDelay * 2, 30000);
@@ -294,9 +297,14 @@
         var db = store.get('demo-db', null) || C.emptyDb();
         if (body.action === 'state') return res(Object.assign({ ok: true }, db));
         var ctx = { now: new Date().toISOString(), today: today() };
-        var r = C.apply(db, body.action, body.payload, ctx);
-        if (r.ok) store.set('demo-db', db); else db = store.get('demo-db', C.emptyDb());
-        res(Object.assign({ ok: r.ok, error: r.error, code: r.code }, db));
+        var results = (body.ops || []).map(function (op) {
+          var trial = JSON.parse(JSON.stringify(db));
+          var r = C.apply(trial, op.action, op.payload, ctx);
+          if (r.ok) db = trial;
+          return { opId: op.opId, ok: r.ok, error: r.error, code: r.code };
+        });
+        store.set('demo-db', db);
+        res(Object.assign({ ok: true, results: results }, db));
       }, 150);
     });
   }
