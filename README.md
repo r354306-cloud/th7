@@ -10,8 +10,16 @@ The Th7 board: everyone's weekly schedule, who's free together, gyms and librari
 - Changes save instantly on the phone, queue up if someone is offline, and retry until the sheet confirms. Retries never double-save.
 - Every change is also written to the sheet's **Log** tab, and the **Free Grid** tab shows who's free when in plain text.
 
-## Change the passcode
+## Change the group passcode
 Open the Th7 Board sheet, go to the **Settings** tab, and change the value next to `passcode`. No redeploy needed.
+
+## Personal passwords
+Everyone picks their own password when they join. Only a salted hash is stored (the `pwhash` column), and every change is checked against the person it belongs to, so nobody can edit someone else's schedule, check-ins or RSVPs. Each phone stays logged in until that person logs out or changes their password.
+
+**Someone forgot their password:** open the **Members** tab and clear their `pwhash` cell. Next time they tap their name, the site asks them to set a new one.
+
+## Profile photos
+Optional. Photos are cropped to a square and compressed on the phone before upload, stored in the `photo` column, and only downloaded again when they change.
 
 ## Update gym or library hours
 Edit `places.js` (hours are minutes after midnight, Monday first). Hours were pulled from the official pages the week of Oct 26, 2026.

@@ -23,7 +23,7 @@
   var API = CFG.API_URL || '';
   var apiParam = params.get('api');
   if (apiParam && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(apiParam)) API = apiParam;
-  var DEMO = !API;
+  var DEMO = !API || (!!params.get('demo') && /^(localhost|127\.0\.0\.1)$/.test(location.hostname));
   var NS = DEMO ? 'th7demo.' : 'th7.';
 
   var PHOTO_HERO = 'photo-mirror-lake.jpg';
@@ -140,7 +140,10 @@
     nav: 'M3 11l18-8-8 18-2-8z',
     wifi: 'M2 8.5a15 15 0 0 1 20 0M5 12a10 10 0 0 1 14 0M8.5 15.5a5 5 0 0 1 7 0M12 19h.01',
     edit: 'M4 20h4L19 9l-4-4L4 16zM14 6l4 4',
-    swap: 'M7 4l-3 3 3 3M4 7h13M17 20l3-3-3-3M20 17H7'
+    swap: 'M7 4l-3 3 3 3M4 7h13M17 20l3-3-3-3M20 17H7',
+    camera: 'M4 8h3l2-3h6l2 3h3v11H4zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
+    key: 'M15 3a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM10.5 13.5 3 21M6 18l2 2M8.5 15.5l2 2',
+    logout: 'M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10'
   };
   function ic(n, cls) { return '<svg class="ic ' + (cls || '') + '" viewBox="0 0 24 24" aria-hidden="true"><path d="' + (ICONS[n] || '') + '"/></svg>'; }
   var TAG_ICON = { party: 'party', out: 'glass', game: 'ball', food: 'food', chill: 'sofa', other: 'dots' };
@@ -157,6 +160,7 @@
     me: store.get('me', ''),
     server: store.get('cache', null),
     outbox: (store.get('outbox', []) || []).filter(function (o) { return o && o.opId && o.action; }),
+    auth: store.get('auth', {}) || {}, photos: store.get('photos', {}) || {}, photoFetch: false, needLogin: '',
     view: store.get('view', 'home'),
     gate: null,
     online: true, pulling: false, flushing: false, lastSync: 0, everSynced: false,
@@ -171,6 +175,25 @@
   var confirmFn = null;
 
   function saveUi() { store.set('ui', S.ui); }
+
+  /* this device's logins: name -> token (never the password) */
+  function tokenFor(name) {
+    if (DEMO) return 'demo';
+    for (var k in S.auth) if (same(k, name)) return S.auth[k];
+    return '';
+  }
+  function setToken(name, token) {
+    var a = {};
+    for (var k in S.auth) if (!same(k, name)) a[k] = S.auth[k];
+    if (token) a[name] = token;
+    S.auth = a; store.set('auth', a);
+  }
+  function askLogin(name, reason) {
+    S.needLogin = name;
+    if (S.sheet && S.sheet.type === 'login') return;
+    var m = M(name);
+    openSheet('login', { name: name, mode: m && m.locked === false ? 'claim' : 'login', reason: reason || '' }, true);
+  }
 
   function recompute() {
     var base = S.server ? JSON.parse(JSON.stringify({
@@ -228,18 +251,18 @@
   }
 
   function persistOutbox() {
-    store.set('outbox', S.outbox.map(function (o) { return { opId: o.opId, action: o.action, payload: o.payload, at: o.at }; }));
+    store.set('outbox', S.outbox.map(function (o) { return { opId: o.opId, action: o.action, payload: o.payload, at: o.at, who: o.who }; }));
   }
 
   function enqueue(action, payload, opts) {
     opts = opts || {};
-    var op = { opId: uid(), action: action, payload: payload, at: Date.now() };
+    var op = { opId: uid(), action: action, payload: payload, at: Date.now(), who: opts.who || S.me };
     if (action === 'saveMember' && !payload.create) {
       for (var i = S.outbox.length - 1; i >= 0; i--) {
         var o = S.outbox[i];
         if (o.inflight) break;
-        if (o.action === 'saveMember' && !o.payload.create && same(o.payload.oldName, payload.oldName) && same(o.payload.member.name, payload.member.name)) {
-          o.payload = { member: payload.member, oldName: o.payload.oldName };
+        if (o.action === 'saveMember' && !o.payload.create && same(o.who, op.who) && same(o.payload.oldName, payload.oldName) && same(o.payload.member.name, payload.member.name)) {
+          o.payload = { member: Object.assign({}, o.payload.member, payload.member), oldName: o.payload.oldName };
           persistOutbox(); recompute(); render({ soft: true });
           return opts.wait ? new Promise(function (res, rej) { waiters[o.opId] = { res: res, rej: rej }; }) : Promise.resolve();
         }
@@ -259,14 +282,25 @@
     if (S.flushing || !S.outbox.length) return;
     if (!DEMO && !S.code) return;
     clearTimeout(S.retryTimer);
+    var who = S.outbox[0].who || S.me;
+    var batch = [];
+    for (var i = 0; i < S.outbox.length && batch.length < 25; i++) {
+      if (!same(S.outbox[i].who || S.me, who)) break;
+      batch.push(S.outbox[i]);
+    }
+    var token = tokenFor(who);
+    if (!token) { renderSync(); askLogin(who, 'expired'); return; }
     S.flushing = true;
     renderSync();
-    var batch = S.outbox.slice(0, 25);
     batch.forEach(function (o) { o.inflight = true; });
     S.writeSeq++;
-    call({ action: 'batch', code: S.code, ops: batch.map(function (o) { return { opId: o.opId, action: o.action, payload: o.payload }; }) }).then(function (r) {
+    call({ action: 'batch', code: S.code, auth: { name: who, token: token }, ops: batch.map(function (o) { return { opId: o.opId, action: o.action, payload: o.payload }; }) }).then(function (r) {
       S.online = true;
-      if (r.code === 'bad_code') { batch.forEach(function (o) { o.inflight = false; }); S.flushing = false; badCode(); return; }
+      batch.forEach(function (o) { o.inflight = false; });
+      if (r.code === 'bad_code') { S.flushing = false; badCode(); return; }
+      if (r.code === 'auth') {                       // logged out (password changed or reset): keep the changes, ask to log in
+        S.flushing = false; setToken(who, ''); setServer(r); recompute(); renderSync(); askLogin(who, 'expired'); return;
+      }
       if (r.code === 'busy' || !Array.isArray(r.results)) throw new Error(r.code || 'bad reply');
       var ids = batch.map(function (o) { return o.opId; });
       S.outbox = S.outbox.filter(function (o) { return ids.indexOf(o.opId) < 0; });
@@ -295,8 +329,19 @@
     return new Promise(function (res) {
       setTimeout(function () {
         var db = store.get('demo-db', null) || C.emptyDb();
-        if (body.action === 'state') return res(Object.assign({ ok: true }, db));
         var ctx = { now: new Date().toISOString(), today: today() };
+        if (body.action === 'state') return res(Object.assign({ ok: true }, db));
+        if (body.action === 'photos') return res({ ok: true, photos: {} });
+        if (body.action === 'login' || body.action === 'claim') {
+          var lm = C.findMember(db, body.name);
+          return res(Object.assign(lm ? { ok: true, token: 'demo', name: lm.name } : { ok: false, code: 'no_member', error: 'Not on the board.' }, db));
+        }
+        if (body.action === 'join') {
+          var jr = C.apply(db, 'saveMember', { member: body.member, create: true }, ctx);
+          if (jr.ok) store.set('demo-db', db);
+          return res(Object.assign({ ok: jr.ok, error: jr.error, code: jr.code, token: jr.ok ? 'demo' : undefined, name: body.member && body.member.name }, db));
+        }
+        if (body.action === 'setPassword' || body.action === 'logout') return res(Object.assign({ ok: true }, db));
         var results = (body.ops || []).map(function (op) {
           var trial = JSON.parse(JSON.stringify(db));
           var r = C.apply(trial, op.action, op.payload, ctx);
@@ -329,9 +374,65 @@
     var L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
     return L > 0.55 ? '#0b0c10' : '#ffffff';
   }
+  function photoKey(m) {
+    if (!m) return '';
+    if (m.photo) return C.photoVersion(m.photo);
+    if (m.pv && S.photos[m.pv]) return m.pv;
+    return '';
+  }
   function av(m, size, extra, z) {
     if (typeof m === 'string') m = M(m) || { name: m, color: '#5a6170' };
-    return '<span class="av av-' + (size || 'md') + ' ' + (extra || '') + '" style="--c:' + esc(m.color) + ';--ink:' + inkFor(m.color) + (z ? ';z-index:' + z : '') + '" title="' + esc(m.name) + '">' + esc(initials(m.name)) + '</span>';
+    var k = photoKey(m);
+    return '<span class="av av-' + (size || 'md') + ' ' + (extra || '') + (k ? ' av-photo ph-' + k : '') + '" style="--c:' + esc(m.color) + ';--ink:' + inkFor(m.color) + (z ? ';z-index:' + z : '') + '" title="' + esc(m.name) + '">' + (k ? '' : esc(initials(m.name))) + '</span>';
+  }
+  var photoCssKeys = null;
+  function syncPhotoCss() {
+    var map = {};
+    DB.members.forEach(function (m) { var k = photoKey(m); if (k) map[k] = m.photo || S.photos[k]; });
+    var keys = Object.keys(map).sort().join(',');
+    if (keys === photoCssKeys) return;
+    photoCssKeys = keys;
+    var el = document.getElementById('photo-css');
+    if (!el) { el = document.createElement('style'); el.id = 'photo-css'; document.head.appendChild(el); }
+    el.textContent = Object.keys(map).map(function (k) { return '.ph-' + k + '{background-image:url("' + map[k] + '")}'; }).join('\n');
+  }
+  function fetchPhotos() {
+    if (S.photoFetch || (!DEMO && !S.code)) return;
+    var need = DB.members.filter(function (m) { return m.pv && !S.photos[m.pv]; }).map(function (m) { return m.name; });
+    if (!need.length) return;
+    S.photoFetch = true;
+    call({ action: 'photos', code: S.code, names: need }).then(function (r) {
+      if (r && r.photos) {
+        Object.keys(r.photos).forEach(function (n) { var p = r.photos[n]; if (p && p.pv && p.data) S.photos[p.pv] = p.data; });
+        var used = {}; DB.members.forEach(function (m) { if (m.pv) used[m.pv] = 1; });
+        Object.keys(S.photos).forEach(function (k) { if (!used[k]) delete S.photos[k]; });
+        store.set('photos', S.photos);
+      }
+    }).catch(function () { /* try again next sync */ }).then(function () {
+      S.photoFetch = false;
+      syncPhotoCss(); render({ soft: true });
+    });
+  }
+  function readPhoto(file) {
+    return new Promise(function (resolve, reject) {
+      if (!file) return reject(new Error('none'));
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () {
+        var size = 192, cv = document.createElement('canvas');
+        cv.width = cv.height = size;
+        var cx = cv.getContext('2d');
+        var w = img.naturalWidth, h = img.naturalHeight, side = Math.min(w, h);
+        cx.fillStyle = '#111'; cx.fillRect(0, 0, size, size);
+        cx.drawImage(img, (w - side) / 2, (h - side) / 2, side, side, 0, 0, size, size);
+        var q = 0.86, data = cv.toDataURL('image/jpeg', q);
+        while (data.length > 38000 && q > 0.4) { q -= 0.08; data = cv.toDataURL('image/jpeg', q); }
+        URL.revokeObjectURL(url);
+        if (!/^data:image\/jpeg;base64,/.test(data)) return reject(new Error('encode'));
+        resolve(data);
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('read')); };
+      img.src = url;
+    });
   }
   function stack(names, max, size) {
     max = max || 4;
@@ -589,6 +690,7 @@
     opts = opts || {};
     if (opts.soft && (isTyping() || S.painting)) { S.pendingRender = true; renderSync(); return; }
     S.pendingRender = false;
+    syncPhotoCss(); fetchPhotos();
     var app = $('#app');
     if (S.gate) {
       if (map) { map.remove(); map = null; markerLayer = null; }
@@ -669,10 +771,14 @@
      Gate: passcode, pick yourself, join
      ========================================================= */
   function decideGate() {
-    if (S.gate === 'new') { if (meM()) S.gate = null; return; }
+    if (S.gate === 'new') return;
     if (!DEMO && !S.code) { S.gate = 'code'; return; }
     if (!S.server) { S.gate = 'loading'; return; }
-    if (!S.me || !meM()) { if (S.me && S.everSynced && !meM() && !pendingMe()) { S.me = ''; store.del('me'); } S.gate = S.me && meM() ? null : 'pick'; return; }
+    var me = meM();
+    if (!S.me || !me || !tokenFor(S.me)) {
+      if (S.me && S.everSynced && !me && !pendingMe()) { S.me = ''; store.del('me'); }
+      S.gate = 'pick'; return;
+    }
     S.gate = null;
   }
   function pendingMe() { return S.outbox.some(function (o) { return o.action === 'saveMember'; }); }
@@ -698,9 +804,10 @@
       var ms = DB.members.slice().sort(function (a, b) { return a.name.localeCompare(b.name); });
       return bg + '<div class="gate-card wide">' + logo(48) +
         '<h1 class="gate-title">Who\'s this?</h1>' +
-        '<p class="gate-sub">' + (ms.length ? 'Tap your name. You only do this once per device.' : 'Nobody is on the board yet. Be the first.') + '</p>' +
+        '<p class="gate-sub">' + (ms.length ? 'Tap your name and enter your password. You stay logged in on this device.' : 'Nobody is on the board yet. Be the first.') + '</p>' +
         '<div class="pick-grid">' + ms.map(function (m) {
-          return '<button class="pick" data-act="pick-me" data-name="' + esc(m.name) + '">' + av(m, 'xl') + '<span>' + esc(m.name) + '</span></button>';
+          var here = !!tokenFor(m.name);
+          return '<button class="pick" data-act="pick-me" data-name="' + esc(m.name) + '"><span class="pick-av">' + av(m, 'xl') + '<i class="pick-lock ' + (here ? 'here' : '') + '">' + ic(here ? 'check' : 'lock') + '</i></span><span>' + esc(m.name) + '</span></button>';
         }).join('') +
         '<button class="pick pick-new" data-act="new-me"><span class="av av-xl av-add">' + ic('plus') + '</span><span>I\'m new</span></button>' +
         '</div></div>' + credit;
@@ -1145,13 +1252,15 @@
   function initDraft(force) {
     var me = meM();
     if (S.draft && !force && (S.saveTimer || pendingMe())) return;
-    if (me) S.draft = { name: me.name, color: me.color, busy: me.busy.split(''), places: me.places.slice(), splits: me.splits.slice(), goal: me.goal, motto: me.motto || '' };
+    if (me) S.draft = { name: me.name, color: me.color, busy: me.busy.split(''), places: me.places.slice(), splits: me.splits.slice(), goal: me.goal, motto: me.motto || '', photo: me.photo || (me.pv && S.photos[me.pv]) || '', photoDirty: false };
     else S.draft = store.get('draft-new', null) || blankDraft();
     if (!Array.isArray(S.draft.busy) || S.draft.busy.length !== SLOTS) S.draft.busy = ZEROS.split('');
   }
   function draftMember() {
     var d = S.draft;
-    return { name: d.name, color: d.color, busy: d.busy.join(''), places: d.places, splits: d.splits, goal: d.goal, motto: d.motto };
+    var out = { name: d.name, color: d.color, busy: d.busy.join(''), places: d.places, splits: d.splits, goal: d.goal, motto: d.motto };
+    if (d.photoDirty) out.photo = d.photo || '';
+    return out;
   }
 
   function meEditor(creating) {
@@ -1177,7 +1286,11 @@
     return '<div class="me-page">' +
       '<div class="page-h"><div><h1>' + (creating ? 'Join Th7' : 'My week') + '</h1><p class="muted">' + (creating ? 'Takes a minute. You can change all of this later.' : 'Changes save on their own.') + '</p></div>' + (creating ? '' : '<span class="sync-inline" id="me-sync"></span>') + '</div>' +
       '<section class="card me-card">' +
-        '<div class="me-top">' + av(preview, 'xxl', 'me-av') +
+        '<div class="me-top"><div class="me-photo">' +
+          (d.photo ? '<span class="av av-xxl me-av av-photo" style="background-image:url(\'' + d.photo + '\')"></span>' : av(preview, 'xxl', 'me-av')) +
+          '<label class="photo-btn" title="' + (d.photo ? 'Change photo' : 'Add a photo') + '" aria-label="' + (d.photo ? 'Change photo' : 'Add a photo') + '">' + ic('camera') + '<input type="file" id="photo-in" accept="image/*" hidden></label>' +
+          (d.photo ? '<button class="photo-x" data-act="photo-remove" aria-label="Remove photo">' + ic('x') + '</button>' : '') +
+          '<span class="photo-hint">' + (d.photo ? 'Tap the camera to change' : 'Photo optional') + '</span></div>' +
           '<div class="me-fields"><label class="field"><span>Name</span><input data-me="name" maxlength="24" placeholder="What the group calls you" value="' + esc(d.name) + '" autocomplete="off"></label>' +
           '<label class="field"><span>Motto (optional)</span><input data-me="motto" maxlength="60" placeholder="Light weight baby" value="' + esc(d.motto) + '" autocomplete="off"></label></div></div>' +
         '<div class="swatches" role="radiogroup" aria-label="Your color">' + TH7_COLORS.map(function (c) { return '<button class="sw ' + (d.color === c ? 'on' : '') + '" style="--c:' + c + '" data-act="me-color" data-v="' + c + '" aria-label="Color ' + c + '"></button>'; }).join('') + '</div>' +
@@ -1195,7 +1308,9 @@
       '<section class="card"><div class="sec-h"><h2>' + ic('bolt') + 'What you train</h2></div><div class="chips">' + TH7_SPLITS.map(function (s) { var on = d.splits.indexOf(s.id) >= 0; return '<button class="chip ' + (on ? 'on' : '') + '" data-act="me-split" data-id="' + s.id + '" aria-pressed="' + on + '">' + esc(s.label) + '</button>'; }).join('') + '</div></section>' +
       (creating
         ? '<div class="join-foot"><p class="err-text" id="join-err"></p><button class="btn btn-primary btn-xl" data-act="me-create">' + ic('bolt') + 'Join the board</button></div>'
-        : '<div class="me-foot"><button class="btn btn-ghost" data-act="switch-user">' + ic('swap') + 'Not ' + esc(firstName(d.name)) + '? Switch</button><button class="btn btn-ghost danger" data-act="remove-me">Remove me from the board</button></div>') +
+        : '<section class="card"><div class="sec-h"><h2>' + ic('key') + 'Your login</h2></div><p class="muted small">Only you can change your schedule, check-ins and RSVPs. On a new phone you log in with your password.</p>' +
+            '<div class="sh-actions wrap"><button class="btn btn-ghost" data-act="change-pw">' + ic('key') + 'Change password</button><button class="btn btn-ghost" data-act="logout">' + ic('logout') + 'Log out of this device</button></div></section>' +
+          '<div class="me-foot"><button class="btn btn-ghost" data-act="logout">' + ic('swap') + 'Not ' + esc(firstName(d.name)) + '? Switch</button><button class="btn btn-ghost danger" data-act="remove-me">Remove me from the board</button></div>') +
       '</div>';
   }
 
@@ -1212,6 +1327,7 @@
     if (!me || !S.draft || S.gate) return;
     var m = draftMember(); m.name = me.name;            // renames go through their own flow
     enqueue('saveMember', { member: m, oldName: me.name });
+    S.draft.photoDirty = false;
     meSync();
   }
   function meSync() {
@@ -1395,6 +1511,45 @@
       '<div class="sh-foot"><button class="btn btn-primary btn-xl" data-act="send-event">' + ic('check') + (spot ? 'Suggest it' : 'Add it') + '</button></div>';
   };
 
+  SHEETS.login = function (a) {
+    var m = M(a.name) || { name: a.name, color: '#5a6170' };
+    var claim = a.mode === 'claim';
+    return '<form class="login-form" data-form="login" autocomplete="on">' +
+      '<div class="person-head">' + av(m, 'xl') + '<div><small class="eyebrow-s">' + (a.reason === 'expired' ? 'Logged out' : (claim ? 'Lock your profile' : 'Welcome back')) + '</small><h2>' + esc(m.name) + '</h2></div></div>' +
+      (a.reason === 'expired' ? '<p class="note">Your password changed or this device got logged out. Log in and your unsaved changes will save.</p>' : '') +
+      (claim ? '<p class="muted">Set a password so nobody else can edit your stuff.</p>' : '') +
+      '<input type="text" name="username" autocomplete="username" value="' + esc(m.name) + '" hidden>' +
+      '<label class="field"><span>' + (claim ? 'New password' : 'Password') + '</span><input id="pw-in" name="password" type="password" autocomplete="' + (claim ? 'new-password' : 'current-password') + '" maxlength="64" required></label>' +
+      (claim ? '<label class="field"><span>Type it again</span><input id="pw-in2" type="password" autocomplete="new-password" maxlength="64" required></label>' : '') +
+      '<p class="err-text" id="pw-err">' + esc(a.err || '') + '</p>' +
+      '<button class="btn btn-primary btn-xl" type="submit">' + ic('lock') + (claim ? 'Save password' : 'Log in') + '</button>' +
+      (claim ? '' : '<p class="muted small center-t">Forgot it? Ricky can reset it from the Google Sheet.</p>') +
+      '</form>';
+  };
+
+  SHEETS.joinpw = function (a) {
+    return '<form data-form="joinpw" autocomplete="on">' +
+      '<div class="sh-head"><small>Last step</small><h2>Lock your profile</h2><p class="muted">Pick a password so only you can change your schedule, check-ins and RSVPs.</p></div>' +
+      '<input type="text" name="username" autocomplete="username" value="' + esc(S.draft ? S.draft.name : '') + '" hidden>' +
+      '<label class="field"><span>Password</span><input id="pw-in" type="password" autocomplete="new-password" maxlength="64" required></label>' +
+      '<label class="field"><span>Type it again</span><input id="pw-in2" type="password" autocomplete="new-password" maxlength="64" required></label>' +
+      '<p class="muted small">At least 4 characters. You will only need it when you log in on a new phone or laptop.</p>' +
+      '<p class="err-text" id="pw-err">' + esc(a.err || '') + '</p>' +
+      '<button class="btn btn-primary btn-xl" type="submit">' + ic('bolt') + 'Join the board</button>' +
+      '</form>';
+  };
+
+  SHEETS.setpw = function (a) {
+    return '<form data-form="setpw" autocomplete="on">' +
+      '<div class="sh-head"><small>Your login</small><h2>Change password</h2><p class="muted">You stay logged in here. Any other phones get logged out.</p></div>' +
+      '<input type="text" name="username" autocomplete="username" value="' + esc(S.me) + '" hidden>' +
+      '<label class="field"><span>New password</span><input id="pw-in" type="password" autocomplete="new-password" maxlength="64" required></label>' +
+      '<label class="field"><span>Type it again</span><input id="pw-in2" type="password" autocomplete="new-password" maxlength="64" required></label>' +
+      '<p class="err-text" id="pw-err">' + esc(a.err || '') + '</p>' +
+      '<button class="btn btn-primary btn-xl" type="submit">' + ic('key') + 'Save new password</button>' +
+      '</form>';
+  };
+
   SHEETS.confirm = function (a) {
     return '<div class="sh-head"><h2>' + esc(a.title) + '</h2>' + (a.body ? '<p class="muted">' + esc(a.body) + '</p>' : '') + '</div>' +
       '<div class="sh-actions"><button class="btn ' + (a.danger ? 'btn-danger' : 'btn-primary') + '" data-act="confirm-yes">' + esc(a.yes || 'Yes') + '</button><button class="btn btn-ghost" data-act="close-sheet">' + esc(a.no || 'Never mind') + '</button></div>';
@@ -1485,16 +1640,29 @@
     nav: function (el) { go(el.dataset.v); },
     'close-sheet': function () { closeSheet(); },
     'retry-load': function () { S.online = true; render(); pull(); },
-    'pick-me': function (el) { S.me = el.dataset.name; store.set('me', S.me); S.gate = null; S.view = 'home'; store.set('view', 'home'); render(); toast('Welcome back, ' + firstName(S.me)); },
+    'pick-me': function (el) {
+      var name = el.dataset.name, m = M(name);
+      if (tokenFor(name)) { S.me = m ? m.name : name; store.set('me', S.me); S.gate = null; S.view = 'home'; store.set('view', 'home'); render(); toast('Welcome back, ' + firstName(S.me)); return; }
+      openSheet('login', { name: m ? m.name : name, mode: m && m.locked === false ? 'claim' : 'login' }, true);
+      setTimeout(function () { var i = $('#pw-in'); if (i) i.focus(); }, 350);
+    },
     'new-me': function () { S.me = ''; store.del('me'); S.gate = 'new'; S.draft = store.get('draft-new', null) || blankDraft(); render(); window.scrollTo(0, 0); },
     'back-pick': function () { S.gate = 'pick'; render(); },
-    'switch-user': function () { if (S.saveTimer) saveDraftNow(); S.me = ''; store.del('me'); S.draft = null; S.gate = 'pick'; render(); },
+    logout: function () {
+      if (S.saveTimer) saveDraftNow();
+      if (S.outbox.some(function (o) { return same(o.who || S.me, S.me); })) { toast('Hang on, still saving your last changes.', 'err'); flush(); return; }
+      var name = S.me, token = tokenFor(name);
+      if (token && !DEMO) call({ action: 'logout', code: S.code, auth: { name: name, token: token } }).catch(function () { /* fine */ });
+      setToken(name, ''); S.me = ''; store.del('me'); S.draft = null; S.gate = 'pick'; render(); toast('Logged out of this device');
+    },
+    'change-pw': function () { openSheet('setpw', {}, true); setTimeout(function () { var i = $('#pw-in'); if (i) i.focus(); }, 350); },
+    'photo-remove': function () { S.draft.photo = ''; S.draft.photoDirty = true; draftChanged(); rerenderMe(); },
     'remove-me': function () {
       confirmIt({ title: 'Remove yourself?', body: 'Your profile comes off the board. Your past check-ins and sessions stay in the history (and in the Google Sheet).', yes: 'Remove me', danger: true }, function () {
         var name = S.me;
         S.blocking = 'Removing you';
         enqueue('removeMember', { name: name }, { wait: true }).then(function () {
-          S.blocking = ''; S.me = ''; store.del('me'); S.draft = null; S.gate = 'pick'; render(); toast('You are off the board');
+          S.blocking = ''; setToken(name, ''); S.me = ''; store.del('me'); S.draft = null; S.gate = 'pick'; render(); toast('You are off the board');
         }).catch(function () { S.blocking = ''; render(); });
       });
     },
@@ -1647,19 +1815,9 @@
       else if (!d.places.length) err = 'Pick at least one gym or library.';
       if (err) { if (errEl) errEl.textContent = err; toast(err, 'err'); return; }
       d.name = name;
-      var member = draftMember();
-      S.blocking = 'Putting you on the board';
-      render();
-      enqueue('saveMember', { member: member, create: true }, { wait: true }).then(function () {
-        S.blocking = ''; S.me = name; store.set('me', name); store.del('draft-new');
-        S.gate = null; S.view = 'home'; store.set('view', 'home');
-        initDraft(true);
-        render(); window.scrollTo(0, 0);
-        confetti(200); toast('Welcome to Th7, ' + firstName(name), 'pts', 3600);
-      }).catch(function (r) {
-        S.blocking = ''; render();
-        var e2 = $('#join-err'); if (e2) e2.textContent = (r && r.error) || 'Could not join. Try again.';
-      });
+      store.set('draft-new', d);
+      openSheet('joinpw', {}, true);
+      setTimeout(function () { var i = $('#pw-in'); if (i) i.focus(); }, 350);
     }
   };
 
@@ -1677,14 +1835,18 @@
     var clash = M(newName);
     if (clash && clash !== me) { toast(clash.name + ' is already taken', 'err'); if (input) input.value = me.name; S.draft.name = me.name; return; }
     if (S.saveTimer) saveDraftNow();
-    var old = me.name;
+    var old = me.name, tk = tokenFor(old);
     var m = draftMember(); m.name = newName;
     S.blocking = 'Renaming you everywhere';
+    setToken(newName, tk);                       // the login follows the new name
     S.me = newName; store.set('me', newName);
     render();
-    enqueue('saveMember', { member: m, oldName: old }, { wait: true }).then(function () {
+    enqueue('saveMember', { member: m, oldName: old }, { wait: true, who: old }).then(function () {
+      if (!same(old, newName)) setToken(old, '');
       S.blocking = ''; S.draft.name = newName; render(); toast('You are now ' + newName);
     }).catch(function () {
+      if (!same(old, newName)) setToken(newName, '');
+      setToken(old, tk);
       S.blocking = ''; S.me = old; store.set('me', old); S.draft.name = old; recompute(); render();
     });
   }
@@ -1700,7 +1862,56 @@
     if (fn) { e.preventDefault(); fn(el, e); }
   });
 
+  function pwErr(msg) { var el = $('#pw-err'); if (el) el.textContent = msg; var i = $('#pw-in'); if (i) i.focus(); }
+  function pwBusy(f, label) { var b = f.querySelector('button[type=submit]'); if (b) { b.disabled = !!label; if (label) { b.dataset.html = b.dataset.html || b.innerHTML; b.innerHTML = '<span class="spin sm"></span>' + label; } else if (b.dataset.html) b.innerHTML = b.dataset.html; } }
+  function enterAs(r, msg) {
+    setToken(r.name, r.token); setServer(r); recompute();
+    S.me = r.name; store.set('me', r.name);
+    S.needLogin = ''; S.sheet = null; S.gate = null; decideGate();
+    render(); toast(msg || ('Welcome back, ' + firstName(r.name)), 'pts');
+    flush();
+  }
+  function submitPw(e) {
+    var f = e.target, kind = f.dataset.form;
+    if (kind !== 'login' && kind !== 'joinpw' && kind !== 'setpw') return false;
+    e.preventDefault();
+    var pw = ($('#pw-in') || {}).value || '', pw2El = $('#pw-in2');
+    var a = (S.sheet && S.sheet.args) || {};
+    var needsTwo = kind !== 'login' || a.mode === 'claim';
+    if (needsTwo) {
+      if (pw.length < 4) return pwErr('Use at least 4 characters.'), true;
+      if (pw2El && pw !== pw2El.value) return pwErr('Those passwords do not match.'), true;
+    } else if (!pw) return pwErr('Enter your password.'), true;
+    var body;
+    if (kind === 'login') body = { action: a.mode === 'claim' ? 'claim' : 'login', code: S.code, name: a.name, password: pw };
+    else if (kind === 'joinpw') { var d = S.draft, mem = draftMember(); mem.name = C.str(d.name, 24); mem.photo = d.photo || ''; body = { action: 'join', code: S.code, member: mem, password: pw }; }
+    else body = { action: 'setPassword', code: S.code, auth: { name: S.me, token: tokenFor(S.me) }, password: pw };
+    pwBusy(f, kind === 'joinpw' ? 'Joining' : (kind === 'setpw' ? 'Saving' : 'Checking'));
+    call(body).then(function (r) {
+      if (r.code === 'bad_code') { badCode(); return; }
+      if (kind === 'login') {
+        if (r.ok && r.token) return enterAs(r);
+        if (r.code === 'needs_password') { S.sheet.args = Object.assign({}, a, { mode: 'claim', err: '' }); renderSheet(); return; }
+        pwBusy(f, ''); return pwErr(r.error || 'That did not work.');
+      }
+      if (kind === 'joinpw') {
+        if (r.ok && r.token) {
+          store.del('draft-new'); S.view = 'home'; store.set('view', 'home');
+          enterAs(r, 'Welcome to Th7, ' + firstName(r.name));
+          initDraft(true); window.scrollTo(0, 0); confetti(200);
+          return;
+        }
+        pwBusy(f, ''); return pwErr(r.error || 'Could not join. Try again.');
+      }
+      if (r.ok) { setServer(r); recompute(); closeSheet(); toast('Password changed. Other devices are logged out.', 'pts'); return; }
+      if (r.code === 'auth') { closeSheet(); setToken(S.me, ''); askLogin(S.me, 'expired'); return; }
+      pwBusy(f, ''); pwErr(r.error || 'That did not save.');
+    }).catch(function () { pwBusy(f, ''); pwErr('Cannot reach the board right now. Check your connection and try again.'); });
+    return true;
+  }
+
   document.addEventListener('submit', function (e) {
+    if (submitPw(e)) return;
     var f = e.target;
     if (f.dataset.form === 'code') {
       e.preventDefault();
@@ -1739,6 +1950,14 @@
 
   document.addEventListener('change', function (e) {
     var el = e.target;
+    if (el.id === 'photo-in') {
+      var file = el.files && el.files[0];
+      if (!file || !S.draft) return;
+      readPhoto(file).then(function (data) {
+        S.draft.photo = data; S.draft.photoDirty = true; draftChanged(); rerenderMe(); toast('Photo added');
+      }).catch(function () { toast('Could not read that photo. Try a JPG or PNG.', 'err'); });
+      return;
+    }
     if (el.dataset.f !== undefined && S.sheet) {
       S.form[el.dataset.f] = el.dataset.num !== undefined ? +el.value : el.value;
       if (el.dataset.rr !== undefined) renderSheet();

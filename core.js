@@ -14,6 +14,8 @@ var Th7Core = (function () {
   var TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
   var COLOR_RE = /^#[0-9a-fA-F]{6}$/;
   var TAG_RE = /^[a-z0-9]{2,16}$/;
+  var PHOTO_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+\/]+=*$/;
+  var PHOTO_MAX = 45000;
 
   var SESSION_KINDS = ['workout', 'study'];
   var EVENT_KINDS = ['event', 'spot'];
@@ -101,9 +103,15 @@ var Th7Core = (function () {
         goal: int(m.goal, 1, 7, 4),
         motto: str(m.motto, 60)
       };
+      if (m.photo !== undefined && m.photo !== null) {
+        var ph = String(m.photo);
+        if (ph && (ph.length > PHOTO_MAX || !PHOTO_RE.test(ph))) return fail('That photo did not work. Try a different one.');
+        rec.photo = ph;
+      }
       var clash = findMember(db, name);
       if (p.create) {
         if (clash) return fail(clash.name + ' is already on the board. If that is you, pick your name from the list.', 'name_taken');
+        if (rec.photo === undefined) rec.photo = '';
         rec.joined = ctx.now; rec.updated = ctx.now;
         db.members.push(rec);
         return ok(['members']);
@@ -120,6 +128,7 @@ var Th7Core = (function () {
       if (!p.oldName) return fail('Missing profile name.');
       // the profile we were editing is gone (removed on another device). Never overwrite someone else.
       if (clash) return fail(clash.name + ' is already on the board. Pick a different name.', 'name_taken');
+      if (rec.photo === undefined) rec.photo = '';
       rec.joined = ctx.now; rec.updated = ctx.now;
       db.members.push(rec);
       return ok(['members']);
@@ -235,6 +244,25 @@ var Th7Core = (function () {
     }
   };
 
+  /* short, stable fingerprint of a photo so phones only download it when it changes */
+  function photoVersion(data) {
+    data = String(data || '');
+    if (!data) return '';
+    var h = 5381;
+    for (var i = 0; i < data.length; i++) h = ((h * 33) ^ data.charCodeAt(i)) >>> 0;
+    return 'p' + data.length.toString(36) + h.toString(36);
+  }
+
+  /* who a change is "by" (the person whose password must match) */
+  function actorOf(action, p) {
+    p = p || {};
+    if (action === 'saveMember') return p.create ? null : (p.oldName || (p.member && p.member.name) || null);
+    if (action === 'removeMember' || action === 'checkin' || action === 'sessionOp' || action === 'eventOp') return p.name || null;
+    if (action === 'propose') return (p.session && p.session.by) || null;
+    if (action === 'addEvent') return (p.event && p.event.by) || null;
+    return null;
+  }
+
   function apply(db, action, payload, ctx) {
     var fn = actions[action];
     if (!fn) return fail('Unknown action.');
@@ -245,7 +273,7 @@ var Th7Core = (function () {
   return {
     DAYS: DAYS, H_START: H_START, H_END: H_END, PER_DAY: PER_DAY, SLOTS: SLOTS,
     NAME_RE: NAME_RE, EVENT_TAGS: EVENT_TAGS,
-    apply: apply, emptyDb: emptyDb, sameName: sameName, findMember: findMember,
+    apply: apply, emptyDb: emptyDb, photoVersion: photoVersion, actorOf: actorOf, PHOTO_MAX: PHOTO_MAX, sameName: sameName, findMember: findMember,
     has: has, asList: asList, addDays: addDays, validDate: validDate, str: str, pad: pad
   };
 })();
