@@ -721,3 +721,5 @@ button.ph:hover { background: var(--s3); color: var(--tx); }
   .ci-c { height: 30px; }
   .tl-when { width: 70px; }
 }
+.masked { -webkit-text-security: disc; text-security: disc; letter-spacing: .12em; }
+.masked::placeholder { letter-spacing: 0; }

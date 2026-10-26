@@ -689,7 +689,7 @@
         logo(64) +
         '<h1 class="gate-title">The Th7 board</h1>' +
         '<p class="gate-sub">Workouts, study sessions and nights out. Members only.</p>' +
-        '<label class="field"><span>Group passcode</span><input id="code-in" type="password" inputmode="text" autocapitalize="off" spellcheck="false" placeholder="Enter the passcode" value="" required></label>' +
+        '<label class="field"><span>Group passcode</span><input id="code-in" class="masked" type="text" name="th7-group-code" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-form-type="other" placeholder="Enter the passcode" value="" required></label>' +
         (S.gateErr ? '<p class="err-text">' + esc(S.gateErr) + '</p>' : '') +
         '<button class="btn btn-primary btn-xl" type="submit">' + ic('lock') + 'Let me in</button>' +
         '</form>' + credit;
