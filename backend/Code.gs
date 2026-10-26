@@ -16,6 +16,8 @@ var Th7Core = (function () {
   var TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
   var COLOR_RE = /^#[0-9a-fA-F]{6}$/;
   var TAG_RE = /^[a-z0-9]{2,16}$/;
+  var PHOTO_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+\/]+=*$/;
+  var PHOTO_MAX = 45000;
 
   var SESSION_KINDS = ['workout', 'study'];
   var EVENT_KINDS = ['event', 'spot'];
@@ -103,9 +105,15 @@ var Th7Core = (function () {
         goal: int(m.goal, 1, 7, 4),
         motto: str(m.motto, 60)
       };
+      if (m.photo !== undefined && m.photo !== null) {
+        var ph = String(m.photo);
+        if (ph && (ph.length > PHOTO_MAX || !PHOTO_RE.test(ph))) return fail('That photo did not work. Try a different one.');
+        rec.photo = ph;
+      }
       var clash = findMember(db, name);
       if (p.create) {
         if (clash) return fail(clash.name + ' is already on the board. If that is you, pick your name from the list.', 'name_taken');
+        if (rec.photo === undefined) rec.photo = '';
         rec.joined = ctx.now; rec.updated = ctx.now;
         db.members.push(rec);
         return ok(['members']);
@@ -122,6 +130,7 @@ var Th7Core = (function () {
       if (!p.oldName) return fail('Missing profile name.');
       // the profile we were editing is gone (removed on another device). Never overwrite someone else.
       if (clash) return fail(clash.name + ' is already on the board. Pick a different name.', 'name_taken');
+      if (rec.photo === undefined) rec.photo = '';
       rec.joined = ctx.now; rec.updated = ctx.now;
       db.members.push(rec);
       return ok(['members']);
@@ -237,6 +246,25 @@ var Th7Core = (function () {
     }
   };
 
+  /* short, stable fingerprint of a photo so phones only download it when it changes */
+  function photoVersion(data) {
+    data = String(data || '');
+    if (!data) return '';
+    var h = 5381;
+    for (var i = 0; i < data.length; i++) h = ((h * 33) ^ data.charCodeAt(i)) >>> 0;
+    return 'p' + data.length.toString(36) + h.toString(36);
+  }
+
+  /* who a change is "by" (the person whose password must match) */
+  function actorOf(action, p) {
+    p = p || {};
+    if (action === 'saveMember') return p.create ? null : (p.oldName || (p.member && p.member.name) || null);
+    if (action === 'removeMember' || action === 'checkin' || action === 'sessionOp' || action === 'eventOp') return p.name || null;
+    if (action === 'propose') return (p.session && p.session.by) || null;
+    if (action === 'addEvent') return (p.event && p.event.by) || null;
+    return null;
+  }
+
   function apply(db, action, payload, ctx) {
     var fn = actions[action];
     if (!fn) return fail('Unknown action.');
@@ -247,7 +275,7 @@ var Th7Core = (function () {
   return {
     DAYS: DAYS, H_START: H_START, H_END: H_END, PER_DAY: PER_DAY, SLOTS: SLOTS,
     NAME_RE: NAME_RE, EVENT_TAGS: EVENT_TAGS,
-    apply: apply, emptyDb: emptyDb, sameName: sameName, findMember: findMember,
+    apply: apply, emptyDb: emptyDb, photoVersion: photoVersion, actorOf: actorOf, PHOTO_MAX: PHOTO_MAX, sameName: sameName, findMember: findMember,
     has: has, asList: asList, addDays: addDays, validDate: validDate, str: str, pad: pad
   };
 })();
@@ -256,16 +284,20 @@ var Th7Core = (function () {
    This script lives inside the "Th7 Board" Google Sheet and runs as a web app.
    - Everything the site saves lands in the tabs of this sheet.
    - The group passcode is in the Settings tab (change it there any time, no redeploy needed).
+   - Each person has their own password. Only a salted hash is stored (pwhash column).
+     To reset someone's password: clear their pwhash cell in the Members tab. Next time
+     they log in, the site asks them to set a new one.
    - Every change is written to the Log tab too, so nothing is ever silently lost.
    - The Free Grid tab is a readable "who is free when" view, rebuilt on every schedule save.
    ========================================================================= */
 
 var SHEET_ID = '';                 // leave blank when this script is attached to the sheet
 var TZ = 'America/New_York';
-var DEFAULT_PASSCODE = 'th7grind';
+var DEFAULT_PASSCODE = 'th7derf';
+var SCHEMA = 2;
 
 var TABS = {
-  Members:  ['name', 'color', 'busy', 'places', 'splits', 'goal', 'motto', 'joined', 'updated'],
+  Members:  ['name', 'color', 'busy', 'places', 'splits', 'goal', 'motto', 'joined', 'updated', 'photo', 'pwhash', 'salt', 'tokens'],
   Checkins: ['name', 'date', 'at'],
   Sessions: ['id', 'kind', 'date', 'hour', 'dur', 'place', 'split', 'note', 'by', 'invited', 'going', 'done', 'declined', 'status', 'created', 'updated'],
   Events:   ['id', 'kind', 'tag', 'date', 'time', 'title', 'place', 'notes', 'by', 'going', 'maybe', 'status', 'created', 'updated'],
@@ -276,11 +308,12 @@ var TABS = {
 var DATA_TABS = { members: 'Members', checkins: 'Checkins', sessions: 'Sessions', events: 'Events' };
 var LIST_FIELDS = { places: 1, splits: 1, invited: 1, going: 1, done: 1, declined: 1, maybe: 1 };
 var NUM_FIELDS = { goal: 1, hour: 1, dur: 1 };
+var PRIVATE_FIELDS = ['photo', 'pwhash', 'salt', 'tokens'];
 
 /* ---------- web app entry points ---------- */
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (p.action === 'ping') return json_({ ok: true, th7: true, v: 1 });
+  if (p.action === 'ping') return json_({ ok: true, th7: true, v: SCHEMA });
   return ContentService.createTextOutput('Th7 board backend is running. Open the Th7 site to use it.');
 }
 
@@ -293,6 +326,7 @@ function doPost(e) {
   ensureTabs_(book);
   if (!codeOk_(book, body.code)) return json_({ ok: false, code: 'bad_code', error: 'Wrong passcode.' });
   if (body.action === 'state') return json_(stateFor_(readDb_(book)));
+  if (body.action === 'photos') return json_(photosFor_(readDb_(book), body.names));
 
   var lock = LockService.getScriptLock();
   try { lock.waitLock(28000); }
@@ -300,51 +334,174 @@ function doPost(e) {
 
   try {
     var cache = CacheService.getScriptCache();
-    var single = body.action !== 'batch';
-    var ops = single ? [{ opId: body.opId, action: body.action, payload: body.payload }] : (Array.isArray(body.ops) ? body.ops.slice(0, 40) : []);
     var db = readDb_(book);
     var before = {};
     Object.keys(DATA_TABS).forEach(function (k) { before[k] = JSON.stringify(db[k]); });
     var now = new Date();
     var ctx = { now: now.toISOString(), today: Utilities.formatDate(now, TZ, 'yyyy-MM-dd') };
-    var results = [], removed = [], logs = [], doneKeys = [];
 
-    ops.forEach(function (op) {
-      op = op || {};
-      var key = op.opId ? 'op:' + String(op.opId).slice(0, 40) : null;
-      if (key && cache.get(key)) { results.push({ opId: op.opId, ok: true, duplicate: true }); return; }   // retry of a saved change
-      var trial = JSON.parse(JSON.stringify(db));                     // all-or-nothing per change
-      var res = Th7Core.apply(trial, op.action, op.payload || {}, ctx);
-      if (res.ok) {
-        db = trial;
-        if (res.removed) removed.push(res.removed);
-        if (res.changed.length) logs.push(op);
-        if (key) doneKeys.push(key);
-      }
-      results.push({ opId: op.opId, ok: res.ok, error: res.error, code: res.code });
-    });
+    var out;
+    if (body.action === 'login') out = login_(db, body, cache);
+    else if (body.action === 'claim') out = claim_(db, body);
+    else if (body.action === 'join') out = join_(db, body, ctx);
+    else if (body.action === 'setPassword') out = setPassword_(db, body);
+    else if (body.action === 'logout') out = logout_(db, body);
+    else out = runOps_(db, body, cache, ctx);
+    db = out.db || db;
 
     var changed = [];
     Object.keys(DATA_TABS).forEach(function (k) {
       if (JSON.stringify(db[k]) !== before[k]) { writeTable_(book, DATA_TABS[k], db[k]); changed.push(k); }
     });
-    removed.forEach(function (m) { appendRow_(book, 'Removed', { removedAt: ctx.now, name: m.name, data: JSON.stringify(m) }); });
-    logs.forEach(function (op) { appendRow_(book, 'Log', { at: ctx.now, who: whoFrom_(op), action: op.action, detail: JSON.stringify(op.payload || {}).slice(0, 1500) }); });
+    (out.removed || []).forEach(function (m) { appendRow_(book, 'Removed', { removedAt: ctx.now, name: m.name, data: JSON.stringify(publicMember_(m)) }); });
+    (out.logs || []).forEach(function (l) { appendRow_(book, 'Log', { at: ctx.now, who: String(l.who || '').slice(0, 30), action: l.action, detail: String(l.detail || '').slice(0, 1500) }); });
     if (changed.indexOf('members') >= 0) buildFreeGrid_(book, db.members);
     SpreadsheetApp.flush();
-    doneKeys.forEach(function (k) { try { cache.put(k, '1', 21600); } catch (err) { /* ignore */ } });
+    (out.doneKeys || []).forEach(function (k) { try { cache.put(k, '1', 21600); } catch (err) { /* ignore */ } });
 
     var st = stateFor_(db);
-    st.results = results;
-    if (single) {
-      var r0 = results[0] || { ok: false, error: 'Nothing to do.' };
-      st.ok = r0.ok; if (!r0.ok) { st.error = r0.error; st.code = r0.code; }
-      if (r0.duplicate) st.duplicate = true;
-    }
+    ['ok', 'error', 'code', 'token', 'name', 'results', 'duplicate'].forEach(function (k) { if (out[k] !== undefined) st[k] = out[k]; });
     return json_(st);
   } finally {
     lock.releaseLock();
   }
+}
+
+/* ---------- people, passwords, devices ---------- */
+function hex_(bytes) { return bytes.map(function (b) { return ('0' + ((b + 256) % 256).toString(16)).slice(-2); }).join(''); }
+function sha_(s) { return hex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(s), Utilities.Charset.UTF_8)); }
+function hashPw_(pw, salt) { var h = salt + ':' + pw; for (var i = 0; i < 120; i++) h = sha_(h + ':' + salt); return h; }
+function validPw_(pw) { return typeof pw === 'string' && pw.length >= 4 && pw.length <= 64; }
+function setPw_(m, pw) { m.salt = Utilities.getUuid().replace(/-/g, ''); m.pwhash = hashPw_(pw, m.salt); }
+function checkPw_(m, pw) { return !!m.pwhash && !!m.salt && hashPw_(String(pw || ''), m.salt) === m.pwhash; }
+function issueToken_(m) {
+  var t = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  m.tokens = [sha_(t)].concat(m.tokens || []).slice(0, 8);      // up to 8 devices per person
+  return t;
+}
+function authed_(db, auth) {
+  if (!auth || !auth.name || !auth.token) return null;
+  var m = Th7Core.findMember(db, auth.name);
+  if (!m || !m.pwhash) return null;
+  return (m.tokens || []).indexOf(sha_(auth.token)) >= 0 ? m : null;
+}
+function failKey_(name) { return 'fail:' + String(name).toLowerCase().slice(0, 30); }
+function tooManyTries_(cache, name) { return +(cache.get(failKey_(name)) || 0) >= 8; }
+function noteFail_(cache, name) { var k = failKey_(name); cache.put(k, String(+(cache.get(k) || 0) + 1), 600); }
+function err_(error, code, extra) { var o = { ok: false, error: error, code: code || 'invalid' }; if (extra) for (var k in extra) o[k] = extra[k]; return o; }
+
+function login_(db, body, cache) {
+  var m = Th7Core.findMember(db, body.name);
+  if (!m) return err_('That name is not on the board.', 'no_member');
+  if (!m.pwhash) return err_('Set a password to lock your profile.', 'needs_password', { name: m.name });
+  if (tooManyTries_(cache, m.name)) return err_('Too many wrong tries. Wait 10 minutes and try again.', 'locked');
+  if (!checkPw_(m, body.password)) { noteFail_(cache, m.name); return err_('Wrong password.', 'bad_password'); }
+  try { cache.remove(failKey_(m.name)); } catch (e) { /* ignore */ }
+  return { ok: true, token: issueToken_(m), name: m.name };
+}
+
+function claim_(db, body) {
+  var m = Th7Core.findMember(db, body.name);
+  if (!m) return err_('That name is not on the board.', 'no_member');
+  if (m.pwhash) return err_('This profile already has a password.', 'has_password');
+  if (!validPw_(body.password)) return err_('Passwords need at least 4 characters.');
+  setPw_(m, body.password);
+  m.tokens = [];
+  return { ok: true, token: issueToken_(m), name: m.name, logs: [{ who: m.name, action: 'setPassword', detail: '(new password set)' }] };
+}
+
+function join_(db, body, ctx) {
+  var member = body.member || {};
+  if (!validPw_(body.password)) return err_('Passwords need at least 4 characters.');
+  var name = Th7Core.str(member.name, 24);
+  var existing = Th7Core.findMember(db, name);
+  if (existing) {
+    if (checkPw_(existing, body.password)) return { ok: true, token: issueToken_(existing), name: existing.name };   // a retry of a join that already worked
+    return err_(existing.name + ' is already on the board. If that is you, go back and pick your name.', 'name_taken');
+  }
+  var res = Th7Core.apply(db, 'saveMember', { member: member, create: true }, ctx);
+  if (!res.ok) return res;
+  var m = Th7Core.findMember(db, name);
+  setPw_(m, body.password);
+  m.tokens = [];
+  return { ok: true, token: issueToken_(m), name: m.name, logs: [{ who: m.name, action: 'join', detail: logDetail_({ member: member }) }] };
+}
+
+function setPassword_(db, body) {
+  var m = authed_(db, body.auth);
+  if (!m) return err_('Log in again first.', 'auth');
+  if (!validPw_(body.password)) return err_('Passwords need at least 4 characters.');
+  setPw_(m, body.password);
+  m.tokens = [sha_(body.auth.token)];                    // stay logged in here, log out everywhere else
+  return { ok: true, name: m.name, logs: [{ who: m.name, action: 'setPassword', detail: '(password changed)' }] };
+}
+
+function logout_(db, body) {
+  var m = authed_(db, body.auth);
+  if (m) { var h = sha_(body.auth.token); m.tokens = (m.tokens || []).filter(function (t) { return t !== h; }); }
+  return { ok: true };
+}
+
+function runOps_(db, body, cache, ctx) {
+  var ops = body.action === 'batch' ? (Array.isArray(body.ops) ? body.ops.slice(0, 40) : []) : [{ opId: body.opId, action: body.action, payload: body.payload }];
+  var me = authed_(db, body.auth);
+  if (!me) {
+    return err_('Log in again to save your changes.', 'auth', { results: ops.map(function (op) { return { opId: (op || {}).opId, ok: false, code: 'auth' }; }) });
+  }
+  var meName = me.name;
+  var results = [], removed = [], logs = [], doneKeys = [];
+  ops.forEach(function (op) {
+    op = op || {};
+    var key = op.opId ? 'op:' + String(op.opId).slice(0, 40) : null;
+    if (key && cache.get(key)) { results.push({ opId: op.opId, ok: true, duplicate: true }); return; }   // retry of a saved change
+    var actor = Th7Core.actorOf(op.action, op.payload);
+    if (!actor) { results.push({ opId: op.opId, ok: false, code: 'invalid', error: 'That change is not allowed.' }); return; }
+    if (!meName || !Th7Core.sameName(actor, meName)) { results.push({ opId: op.opId, ok: false, code: 'not_you', error: 'You can only change your own stuff.' }); return; }
+    var trial = JSON.parse(JSON.stringify(db));                     // all-or-nothing per change
+    var res = Th7Core.apply(trial, op.action, op.payload || {}, ctx);
+    if (res.ok) {
+      db = trial;
+      if (res.renamed) meName = res.renamed[1];
+      if (op.action === 'removeMember') meName = null;
+      if (res.removed) removed.push(res.removed);
+      if (res.changed.length) logs.push({ who: actor, action: op.action, detail: logDetail_(op.payload) });
+      if (key) doneKeys.push(key);
+    }
+    results.push({ opId: op.opId, ok: res.ok, error: res.error, code: res.code });
+  });
+  var out = { db: db, results: results, removed: removed, logs: logs, doneKeys: doneKeys };
+  if (body.action !== 'batch') {
+    var r0 = results[0] || { ok: false, error: 'Nothing to do.' };
+    out.ok = r0.ok; if (!r0.ok) { out.error = r0.error; out.code = r0.code; }
+    if (r0.duplicate) out.duplicate = true;
+  }
+  return out;
+}
+
+function logDetail_(payload) {
+  var p = JSON.parse(JSON.stringify(payload || {}));
+  if (p.member && p.member.photo) p.member.photo = '(photo)';
+  delete p.password;
+  return JSON.stringify(p);
+}
+
+function publicMember_(m) {
+  var o = {};
+  for (var k in m) if (PRIVATE_FIELDS.indexOf(k) < 0) o[k] = m[k];
+  o.pv = Th7Core.photoVersion(m.photo);
+  o.locked = !!m.pwhash;
+  return o;
+}
+
+function photosFor_(db, names) {
+  var want = Array.isArray(names) ? names : null;
+  var photos = {};
+  db.members.forEach(function (m) {
+    if (!m.photo) return;
+    if (want && !want.some(function (n) { return Th7Core.sameName(n, m.name); })) return;
+    photos[m.name] = { pv: Th7Core.photoVersion(m.photo), data: m.photo };
+  });
+  return { ok: true, photos: photos };
 }
 
 /* ---------- sheet helpers ---------- */
@@ -365,6 +522,16 @@ function ensureTabs_(book) {
   });
   var blank = book.getSheetByName('Sheet1');
   if (blank && blank.getLastRow() === 0 && book.getSheets().length > 1) book.deleteSheet(blank);
+  // add any new columns to older tabs (runs once per schema version)
+  var cache = CacheService.getScriptCache();
+  if (cache.get('schema') !== String(SCHEMA)) {
+    Object.keys(TABS).forEach(function (name) {
+      var sh = book.getSheetByName(name), head = TABS[name];
+      var cur = sh.getRange(1, 1, 1, head.length).getValues()[0].map(String);
+      if (cur.join('|') !== head.join('|')) sh.getRange(1, 1, 1, head.length).setNumberFormat('@').setValues([head]).setFontWeight('bold');
+    });
+    cache.put('schema', String(SCHEMA), 21600);
+  }
 }
 
 function codeOk_(book, code) {
@@ -387,6 +554,7 @@ function fromRow_(head, row) {
   head.forEach(function (h, i) {
     var v = cell_(row[i]);
     if (h === 'busy') { v = v.replace(/^v1\./, ''); if (!/^[01]+$/.test(v) || v.length !== Th7Core.SLOTS) v = new Array(Th7Core.SLOTS + 1).join('0'); }
+    else if (h === 'tokens') v = v.split(',').map(function (t) { return t.trim(); }).filter(function (t) { return /^[0-9a-f]{64}$/.test(t); });
     else if (LIST_FIELDS[h]) v = Th7Core.asList(v);
     else if (NUM_FIELDS[h]) v = parseInt(v, 10) || 0;
     o[h] = v;
@@ -398,7 +566,7 @@ function toRow_(head, o) {
   return head.map(function (h) {
     var v = o[h];
     if (h === 'busy') return 'v1.' + v;
-    if (LIST_FIELDS[h]) return (v || []).join(', ');
+    if (LIST_FIELDS[h] || h === 'tokens') return (v || []).join(', ');
     if (v == null) return '';
     v = String(v);
     return /^[=+@]/.test(v) ? v.replace(/^[=+@]+/, '') : v;
@@ -441,17 +609,11 @@ function readDb_(book) {
 }
 
 function stateFor_(db) {
-  return { ok: true, v: 1, now: new Date().toISOString(), members: db.members, checkins: db.checkins, sessions: db.sessions, events: db.events };
-}
-
-function whoFrom_(body) {
-  var p = body.payload || {};
-  return String(p.name || (p.member && p.member.name) || (p.session && p.session.by) || (p.event && p.event.by) || '').slice(0, 30);
+  return { ok: true, v: SCHEMA, now: new Date().toISOString(), members: db.members.map(publicMember_), checkins: db.checkins, sessions: db.sessions, events: db.events };
 }
 
 function buildFreeGrid_(book, members) {
   var sh = book.getSheetByName('Free Grid') || book.insertSheet('Free Grid');
-  var days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   var rows = [['Who is free', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']];
   for (var h = Th7Core.H_START; h < Th7Core.H_END; h++) {
     var row = [label_(h) + ' - ' + label_(h + 1)];
